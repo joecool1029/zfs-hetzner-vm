@@ -786,7 +786,7 @@ if (( c_efimode_enabled == 1 )); then
   #chroot_execute grub-probe /boot
   chroot_execute grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --recheck
 else
-  for disk in ${v_selected_disks[@]}; do
+  for disk in "${v_selected_disks[@]}"; do
     chroot_execute "grub-install --recheck $disk"
   done
 fi

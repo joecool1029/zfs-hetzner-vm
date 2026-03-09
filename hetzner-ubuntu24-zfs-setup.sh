@@ -427,6 +427,7 @@ function bootstrap_ubuntu_system {
     apt-get -o APT::Sandbox::User=root download ubuntu-keyring
 
     # Verify download was successful
+    # shellcheck disable=SC2144
     if [ ! -f ubuntu-keyring*.deb ]; then
         echo "ERROR: Failed to download ubuntu-keyring package"
         exit 1
