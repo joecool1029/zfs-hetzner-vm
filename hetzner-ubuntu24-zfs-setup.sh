@@ -179,7 +179,8 @@ function get_root_password {
 }
 
 function show_summary_and_confirm {
-    local summary="Please review the installation settings:
+    local summary
+    summary="Please review the installation settings:
 
 Hostname: $SYSTEM_HOSTNAME
 ZFS Pool: $ZFS_POOL
@@ -232,7 +233,9 @@ function detect_efi {
     else
         echo "✓ Legacy BIOS mode detected"
         EFI_MODE=false
+        # shellcheck disable=SC2034
         BOOT_LABEL="boot"
+        # shellcheck disable=SC2034
         BOOT_TYPE="8300"
     fi
 }
@@ -405,7 +408,8 @@ function set_final_mountpoints {
 # ---- System Bootstrap Functions ----
 function bootstrap_ubuntu_system {
     echo "======= Bootstrapping Ubuntu to temporary directory =========="
-    local TEMP_STAGE=$(mktemp -d)
+    local TEMP_STAGE
+    TEMP_STAGE=$(mktemp -d)
     echo "Created temporary staging directory: $TEMP_STAGE"
     
     # Cleanup function for temp directory
@@ -495,7 +499,8 @@ function configure_dns_resolution {
         echo "Getting DNS from resolvectl..."
         
         # First try Global DNS servers
-        local DNS_SERVERS=$(resolvectl dns | awk '
+        local DNS_SERVERS
+        DNS_SERVERS=$(resolvectl dns | awk '
             /^Global:/ { 
                 for(i=2; i<=NF; i++) print $i 
             }
@@ -706,7 +711,8 @@ EOF
     cat "$MAIN_BOOT/extlinux.conf"
     
     # Download and install ZFSBootMenu for BIOS
-    local TEMP_ZBM=$(mktemp -d)
+    local TEMP_ZBM
+    TEMP_ZBM=$(mktemp -d)
     echo "Downloading ZFSBootMenu for BIOS from: $ZBM_BIOS_URL"
     curl -L "$ZBM_BIOS_URL" -o "$TEMP_ZBM/zbm.tar.gz"
     tar -xz -C "$TEMP_ZBM" -f "$TEMP_ZBM/zbm.tar.gz" --strip-components=1

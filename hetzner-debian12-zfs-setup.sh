@@ -329,6 +329,7 @@ function ask_pool_tweaks {
   # shellcheck disable=SC2119
   print_step_info_header
 
+  # shellcheck disable=SC2034
   v_bpool_tweaks=$(dialog --inputbox "Insert the tweaks for the boot pool" 30 100 -- "$c_default_bpool_tweaks" 3>&1 1>&2 2>&3)
   v_rpool_tweaks=$(dialog --inputbox "Insert the tweaks for the root pool" 30 100 -- "$c_default_rpool_tweaks" 3>&1 1>&2 2>&3)
 

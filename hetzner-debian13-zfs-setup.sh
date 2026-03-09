@@ -30,8 +30,11 @@ MAIN_BOOT="/main_boot"
 
 # Hetzner mirrors for Debian
 MIRROR_SITE="https://mirror.hetzner.com"
+# shellcheck disable=SC2034
 MIRROR_MAIN="deb ${MIRROR_SITE}/debian/packages ${DEBIAN_CODENAME} main contrib non-free non-free-firmware"
+# shellcheck disable=SC2034
 MIRROR_UPDATES="deb ${MIRROR_SITE}/debian/packages ${DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware"
+# shellcheck disable=SC2034
 MIRROR_SECURITY="deb ${MIRROR_SITE}/debian/security ${DEBIAN_CODENAME}-security main contrib non-free non-free-firmware"
 
 # Global variables
@@ -176,7 +179,8 @@ function get_root_password {
 }
 
 function show_summary_and_confirm {
-    local summary="Please review the installation settings:
+    local summary
+    summary="Please review the installation settings:
 
 Hostname: $SYSTEM_HOSTNAME
 ZFS Pool: $ZFS_POOL
@@ -229,7 +233,9 @@ function detect_efi {
     else
         echo "✓ Legacy BIOS mode detected"
         EFI_MODE=false
+        # shellcheck disable=SC2034
         BOOT_LABEL="boot"
+        # shellcheck disable=SC2034
         BOOT_TYPE="8300"
     fi
 }
@@ -681,7 +687,8 @@ EOF
     cat "$MAIN_BOOT/extlinux.conf"
     
     # Download and install ZFSBootMenu for BIOS
-    local TEMP_ZBM=$(mktemp -d)
+    local TEMP_ZBM
+    TEMP_ZBM=$(mktemp -d)
     echo "Downloading ZFSBootMenu for BIOS from: $ZBM_BIOS_URL"
     curl -L "$ZBM_BIOS_URL" -o "$TEMP_ZBM/zbm.tar.gz"
     tar -xz -C "$TEMP_ZBM" -f "$TEMP_ZBM/zbm.tar.gz" --strip-components=1
