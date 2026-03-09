@@ -22,4 +22,4 @@ chmod +x /opt/shellcheck/shellcheck
 
 /opt/shellcheck/shellcheck --version
 
-grep -lZP '^#!/bin/\w+sh' -R | xargs -0 /opt/shellcheck/shellcheck
+grep -lZP '^#!/bin/\w+sh' -R --exclude-dir=.git | xargs -0 /opt/shellcheck/shellcheck
