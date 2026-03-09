@@ -287,10 +287,13 @@ function remove_unused_kernels {
 function install_zfs_on_rescue_system {
     echo "======= Installing ZFS on rescue system =========="
     echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
-    # Enable Hetzner bookworm-backports
-    sed -i 's/^# deb http:\/\/mirror.hetzner.com\/debian\/packages bookworm-backports/deb http:\/\/mirror.hetzner.com\/debian\/packages bookworm-backports/' /etc/apt/sources.list
+    # Enable backports for the rescue system's release
+    local rescue_codename
+    # shellcheck disable=SC1091
+    rescue_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    sed -i "s/^# deb http:\/\/mirror.hetzner.com\/debian\/packages ${rescue_codename}-backports/deb http:\/\/mirror.hetzner.com\/debian\/packages ${rescue_codename}-backports/" /etc/apt/sources.list
     apt update
-    apt -t bookworm-backports install -y zfsutils-linux
+    apt -t "${rescue_codename}-backports" install -y zfsutils-linux
 }
 
 # ---- Disk Partitioning Functions ----
@@ -333,10 +336,6 @@ function partition_disk {
 # ---- ZFS Pool and Dataset Functions ----
 function create_zfs_pool {
     echo "======= Creating ZFS pool =========="
-    # Clean up any existing ZFS binaries in PATH
-    rm -f "$(which zfs)" 2>/dev/null || true
-    rm -f "$(which zpool)" 2>/dev/null || true
-    
     export PATH=/usr/sbin:$PATH
     modprobe zfs
     
@@ -546,16 +545,13 @@ set -euo pipefail
 # Set hostname from variable
 echo "$SYSTEM_HOSTNAME" > /etc/hostname
 
-# Configure timezone (Vienna)
-echo "Europe/Vienna" > /etc/timezone
-ln -sf /usr/share/zoneinfo/Europe/Vienna /etc/localtime
+# Configure timezone
+echo "UTC" > /etc/timezone
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
 # Generate locales
 cat > /etc/locale.gen <<'LOCALES'
 en_US.UTF-8 UTF-8
-de_AT.UTF-8 UTF-8
-fr_FR.UTF-8 UTF-8  
-ru_RU.UTF-8 UTF-8
 LOCALES
 
 locale-gen
@@ -563,16 +559,16 @@ locale-gen
 # Set default locale
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-# Configure keyboard for German and US with Alt+Shift toggle
+# Configure keyboard for US layout
 cat > /etc/default/keyboard <<'KEYBOARD'
 # KEYBOARD CONFIGURATION FILE
 
 # Consult the keyboard(5) manual page.
 
 XKBMODEL="pc105"
-XKBLAYOUT="de,ru"
-XKBVARIANT=","
-XKBOPTIONS="grp:ctrl_shift_toggle"
+XKBLAYOUT="us"
+XKBVARIANT=""
+XKBOPTIONS=""
 
 BACKSPACE="guess"
 KEYBOARD
@@ -599,7 +595,7 @@ echo "Timezone: $(cat /etc/timezone)"
 echo "Current time: $(date)"
 echo "Default locale: $(grep LANG /etc/default/locale)"
 echo "Available locales:"
-locale -a | grep -E "(en_US|de_AT|fr_FR|ru_RU)"
+locale -a | grep -E "en_US"
 echo "Keyboard layout: $(grep XKBLAYOUT /etc/default/keyboard)"
 EOF
 }
@@ -964,12 +960,11 @@ function main {
     
     # Phase 6: Cleanup and finalization
     unmount_chroot_environment
-    finalize_system_resolved    
-    unmount_all_datasets_and_partitions
-    
-    # Phase 7: Final mountpoints and export    
+    finalize_system_resolved
     set_final_mountpoints
-    
+    unmount_all_datasets_and_partitions
+
+    # Phase 7: Export pool
     export_zfs_pool
     
     show_final_instructions
