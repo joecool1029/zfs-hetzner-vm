@@ -17,17 +17,14 @@ end_header_info
 set -euo pipefail
 
 # ---- Configuration ----
-# These will be set by user input
 SYSTEM_HOSTNAME=""
 ROOT_PASSWORD=""
 ZFS_POOL=""
 UBUNTU_CODENAME="noble"   # Ubuntu 24.04
 TARGET="/mnt/ubuntu"
-
-ZBM_BIOS_URL="https://github.com/zbm-dev/zfsbootmenu/releases/download/v3.0.1/zfsbootmenu-release-x86_64-v3.0.1-linux6.1.tar.gz"
-ZBM_EFI_URL="https://github.com/zbm-dev/zfsbootmenu/releases/download/v3.0.1/zfsbootmenu-release-x86_64-v3.0.1-linux6.1.EFI"
-
-MAIN_BOOT="/main_boot"
+ENCRYPT_ROOT=0             # 0=false, 1=true
+LUKS_PASSPHRASE=""
+LUKS_DEVICE_NAME="cryptroot"
 
 # Hetzner mirrors
 MIRROR_SITE="https://mirror.hetzner.com"
@@ -39,10 +36,9 @@ MIRROR_SECURITY="deb ${MIRROR_SITE}/ubuntu/security ${UBUNTU_CODENAME}-security 
 # Global variables
 INSTALL_DISK=""
 EFI_MODE=false
-BOOT_LABEL=""
-BOOT_TYPE=""
 BOOT_PART=""
 ZFS_PART=""
+ZFS_DEVICE=""  # either raw partition or /dev/mapper/cryptroot
 
 # ---- User Input Functions ----
 function setup_whiptail_colors {
@@ -74,7 +70,6 @@ function check_whiptail {
     setup_whiptail_colors
 }
 
-
 function get_hostname {
     while true; do
         SYSTEM_HOSTNAME=$(whiptail \
@@ -82,13 +77,13 @@ function get_hostname {
             --inputbox "Enter the hostname for the new system:" \
             10 60 "zfs-ubuntu" \
             3>&1 1>&2 2>&3)
-        
+
         local exit_status=$?
         if [ $exit_status -ne 0 ]; then
             whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
             exit 1
         fi
-        
+
         # Validate hostname
         if [[ "$SYSTEM_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$ ]] && [[ ${#SYSTEM_HOSTNAME} -le 63 ]]; then
             break
@@ -108,13 +103,13 @@ function get_zfs_pool_name {
             --inputbox "Enter the name for the ZFS pool:" \
             10 60 "rpool" \
             3>&1 1>&2 2>&3)
-        
+
         local exit_status=$?
         if [ $exit_status -ne 0 ]; then
             whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
             exit 1
         fi
-        
+
         # Validate ZFS pool name
         if [[ "$ZFS_POOL" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && [[ ${#ZFS_POOL} -le 255 ]]; then
             break
@@ -129,36 +124,33 @@ function get_zfs_pool_name {
 
 function get_root_password {
     while true; do
-        # Get first password input
         local password1
         local password2
-        
+
         password1=$(whiptail \
             --title "Root Password" \
             --passwordbox "Enter root password (input hidden):" \
             10 60 \
             3>&1 1>&2 2>&3)
-        
+
         local exit_status=$?
         if [ $exit_status -ne 0 ]; then
             whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
             exit 1
         fi
-        
-        # Get password confirmation
+
         password2=$(whiptail \
             --title "Confirm Root Password" \
             --passwordbox "Confirm root password (input hidden):" \
             10 60 \
             3>&1 1>&2 2>&3)
-        
+
         exit_status=$?
         if [ $exit_status -ne 0 ]; then
             whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
             exit 1
         fi
-        
-        # Check if passwords match
+
         if [ "$password1" = "$password2" ]; then
             if [ -n "$password1" ]; then
                 ROOT_PASSWORD="$password1"
@@ -178,7 +170,68 @@ function get_root_password {
     done
 }
 
+function ask_encryption {
+    if whiptail \
+        --title "LUKS Disk Encryption" \
+        --defaultno \
+        --yesno "Do you want to encrypt the root disk with LUKS?\n\nThis enables full disk encryption with dm-crypt/LUKS.\nYou will need to enter a passphrase at boot (via dropbear SSH)." \
+        12 70; then
+        ENCRYPT_ROOT=1
+
+        while true; do
+            local pass1
+            local pass2
+
+            pass1=$(whiptail \
+                --title "LUKS Passphrase" \
+                --passwordbox "Enter LUKS encryption passphrase (input hidden):" \
+                10 60 \
+                3>&1 1>&2 2>&3)
+
+            local exit_status=$?
+            if [ $exit_status -ne 0 ]; then
+                whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
+                exit 1
+            fi
+
+            pass2=$(whiptail \
+                --title "Confirm LUKS Passphrase" \
+                --passwordbox "Confirm LUKS encryption passphrase (input hidden):" \
+                10 60 \
+                3>&1 1>&2 2>&3)
+
+            exit_status=$?
+            if [ $exit_status -ne 0 ]; then
+                whiptail --title "Cancelled" --msgbox "Installation cancelled by user." 10 50
+                exit 1
+            fi
+
+            if [ "$pass1" = "$pass2" ]; then
+                if [ -n "$pass1" ]; then
+                    LUKS_PASSPHRASE="$pass1"
+                    break
+                else
+                    whiptail \
+                        --title "Empty Passphrase" \
+                        --msgbox "Passphrase cannot be empty. Please enter a passphrase." \
+                        10 50
+                fi
+            else
+                whiptail \
+                    --title "Passphrase Mismatch" \
+                    --msgbox "Passphrases do not match. Please try again." \
+                    10 50
+            fi
+        done
+    fi
+}
+
 function show_summary_and_confirm {
+    local encryption_status="No"
+    if [ "$ENCRYPT_ROOT" = "1" ]; then
+        encryption_status="Yes (LUKS + dropbear SSH unlock)"
+    fi
+
     local summary
     summary="Please review the installation settings:
 
@@ -188,16 +241,16 @@ Ubuntu Version: $UBUNTU_CODENAME (24.04)
 Target: $TARGET
 Boot Mode: $([ "$EFI_MODE" = true ] && echo "EFI" || echo "BIOS")
 Install Disk: $INSTALL_DISK
+Encryption: $encryption_status
 
 *** WARNING: This will DESTROY ALL DATA on $INSTALL_DISK! ***
 
 Do you want to continue with the installation?"
-    
+
     if whiptail \
         --title " Installation Summary " \
         --yesno "$summary" \
-        18 60; then
-        # User confirmed - just continue silently
+        20 60; then
         echo "User confirmed installation. Starting now..."
     else
         echo "Installation cancelled by user."
@@ -208,60 +261,52 @@ Do you want to continue with the installation?"
 function get_user_input {
     echo "======= Gathering Installation Parameters =========="
     check_whiptail
-    
+
     # Show welcome message
     whiptail \
         --title "ZFS Ubuntu Installer" \
         --msgbox "Welcome to the ZFS Ubuntu Installer for Hetzner Cloud.\n\nThis script will install Ubuntu 24.04 with ZFS root on your server." \
         12 60
-    
-    # Get user inputs
+
     get_hostname
     get_zfs_pool_name
     get_root_password
+    ask_encryption
 }
 
 # ---- System Detection Functions ----
 function detect_efi {
     echo "======= Detecting EFI support =========="
-    
+
     if [ -d /sys/firmware/efi ]; then
-        echo "✓ EFI firmware detected"
+        echo "EFI firmware detected"
         EFI_MODE=true
-        BOOT_LABEL="EFI"
-        BOOT_TYPE="ef00"
     else
-        echo "✓ Legacy BIOS mode detected"
+        echo "Legacy BIOS mode detected"
         EFI_MODE=false
-        # shellcheck disable=SC2034
-        BOOT_LABEL="boot"
-        # shellcheck disable=SC2034
-        BOOT_TYPE="8300"
     fi
 }
 
 function find_install_disk {
     echo "======= Finding install disk =========="
-    
+
     local candidate_disks=()
-    
-    # Use lsblk to find all unmounted, writable disks
+
     while IFS= read -r disk; do
         [[ -n "$disk" ]] && candidate_disks+=("$disk")
     done < <(lsblk -npo NAME,TYPE,RO,MOUNTPOINT | awk '
         $2 == "disk" && $3 == "0" && $4 == "" {print $1}
     ')
-    
+
     if [[ ${#candidate_disks[@]} -eq 0 ]]; then
         echo "No suitable installation disks found" >&2
         echo "Looking for: unmounted, writable disks without partitions in use" >&2
         exit 1
     fi
-    
+
     INSTALL_DISK="${candidate_disks[0]}"
     echo "Using installation disk: $INSTALL_DISK"
-    
-    # Show all available disks for verification
+
     echo "All available disks:"
     lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO | grep -v loop
 }
@@ -299,183 +344,147 @@ function install_zfs_on_rescue_system {
 # ---- Disk Partitioning Functions ----
 function partition_disk {
     echo "======= Partitioning disk =========="
-    sgdisk -Z "$INSTALL_DISK"  
-    
+    sgdisk -Z "$INSTALL_DISK"
+
     if [ "$EFI_MODE" = true ]; then
         echo "Creating EFI partition layout"
-        # EFI System Partition (ESP) - 64MB is plenty for ZFSBootMenu
-        sgdisk -n1:1M:+128M -t1:ef00 -c1:"EFI" "$INSTALL_DISK"
-        # ZFS partition
-        sgdisk -n2:0:0   -t2:bf00 -c2:"zfs"  "$INSTALL_DISK"
+        # BIOS boot partition (for grub hybrid)
+        sgdisk -a1 -n1:24K:+1000K -t1:EF02 -c1:"bios_grub" "$INSTALL_DISK"
+        # EFI System Partition
+        sgdisk -n2:1M:+512M -t2:EF00 -c2:"EFI" "$INSTALL_DISK"
+        # Boot pool partition
+        sgdisk -n3:0:+2G -t3:BF01 -c3:"bpool" "$INSTALL_DISK"
+        # Root partition (ZFS or LUKS+ZFS)
+        sgdisk -n4:0:0 -t4:BF01 -c4:"rpool" "$INSTALL_DISK"
     else
         echo "Creating BIOS partition layout"
-        # /boot partition - 64MB is also sufficient for BIOS ZFSBootMenu
-        sgdisk -n1:1M:+128M -t1:8300 -c1:"boot" "$INSTALL_DISK"
-        # ZFS partition
-        sgdisk -n2:0:0   -t2:bf00 -c2:"zfs"  "$INSTALL_DISK"
-        # Set legacy BIOS bootable flag
-        sgdisk -A 1:set:2 "$INSTALL_DISK"
+        # BIOS boot partition
+        sgdisk -a1 -n1:24K:+1000K -t1:EF02 -c1:"bios_grub" "$INSTALL_DISK"
+        # Boot pool partition
+        sgdisk -n2:1M:+2G -t2:BF01 -c2:"bpool" "$INSTALL_DISK"
+        # Root partition (ZFS or LUKS+ZFS)
+        sgdisk -n3:0:0 -t3:BF01 -c3:"rpool" "$INSTALL_DISK"
     fi
-    
+
     partprobe "$INSTALL_DISK" || true
     udevadm settle
-    
-    # Set partition variables based on mode
+
+    # Set partition variables
     if [ "$EFI_MODE" = true ]; then
         BOOT_PART="$(blkid -t PARTLABEL='EFI' -o device)"
-        ZFS_PART="$(blkid -t PARTLABEL='zfs' -o device)"
-        # Format ESP as FAT32
+        local BPOOL_PART
+        BPOOL_PART="$(blkid -t PARTLABEL='bpool' -o device)"
+        ZFS_PART="$(blkid -t PARTLABEL='rpool' -o device)"
         mkfs.fat -F 32 -n EFI "$BOOT_PART"
     else
-        BOOT_PART="$(blkid -t PARTLABEL='boot' -o device)"
-        ZFS_PART="$(blkid -t PARTLABEL='zfs' -o device)"
-        mkfs.ext4 -F -L boot "$BOOT_PART"
+        local BPOOL_PART
+        BPOOL_PART="$(blkid -t PARTLABEL='bpool' -o device)"
+        ZFS_PART="$(blkid -t PARTLABEL='rpool' -o device)"
     fi
+
+    # Export BPOOL_PART for use by pool creation
+    export BPOOL_PART
+}
+
+function setup_luks {
+    echo "======= Setting up LUKS encryption =========="
+    apt install -y cryptsetup
+
+    echo -n "$LUKS_PASSPHRASE" | cryptsetup luksFormat --type luks2 "$ZFS_PART" -
+
+    echo -n "$LUKS_PASSPHRASE" | cryptsetup open --type luks2 "$ZFS_PART" "$LUKS_DEVICE_NAME" -
+
+    ZFS_DEVICE="/dev/mapper/$LUKS_DEVICE_NAME"
+    echo "LUKS device opened at $ZFS_DEVICE"
 }
 
 # ---- ZFS Pool and Dataset Functions ----
-function create_zfs_pool {
-    echo "======= Creating ZFS pool =========="
+function create_zfs_pools {
+    echo "======= Creating ZFS pools =========="
     export PATH=/usr/sbin:$PATH
     modprobe zfs
-    
-    zpool create -f -o ashift=12 \
-    -o cachefile="/etc/zfs/zpool.cache" \
-    -O compression=lz4 \
-    -O acltype=posixacl \
-    -O xattr=sa \
-    -O mountpoint=none \
-    "$ZFS_POOL" "$ZFS_PART"
 
-    zfs create -o mountpoint=none   "$ZFS_POOL/ROOT"
-    zfs create -o mountpoint=legacy "$ZFS_POOL/ROOT/ubuntu"
+    # If not encrypting, ZFS goes directly on the partition
+    if [ "$ENCRYPT_ROOT" != "1" ]; then
+        ZFS_DEVICE="$ZFS_PART"
+    fi
 
-    echo "======= Assigning $ZFS_POOL/ROOT/ubuntu dataset as bootable =========="
-    zpool set bootfs="$ZFS_POOL/ROOT/ubuntu" "$ZFS_POOL"
-    zpool set cachefile="/etc/zfs/zpool.cache" "$ZFS_POOL"
-}
+    # Create boot pool (unencrypted, on separate partition)
+    zpool create -f \
+        -o ashift=12 \
+        -o cachefile=/etc/zpool.cache \
+        -O compression=lz4 \
+        -O canmount=off \
+        -O devices=off \
+        -O mountpoint=/boot \
+        -R "$TARGET" \
+        bpool "$BPOOL_PART"
 
-function create_additional_zfs_datasets {
-    echo "======= Creating additional ZFS datasets with TEMPORARY mountpoints =========="
-    
-    # Ensure parent datasets are created first
-    zfs create -o mountpoint=none "$ZFS_POOL/ROOT/ubuntu/var"
-    zfs create -o mountpoint=none "$ZFS_POOL/ROOT/ubuntu/var/cache"
-    
-    # Create leaf datasets with temporary mountpoints under $TARGET
-    zfs create -o com.sun:auto-snapshot=false -o mountpoint="$TARGET/tmp" "$ZFS_POOL/ROOT/ubuntu/tmp"
-    zfs set devices=off "$ZFS_POOL/ROOT/ubuntu/tmp"
-    
-    zfs create -o com.sun:auto-snapshot=false -o mountpoint="$TARGET/var/tmp" "$ZFS_POOL/ROOT/ubuntu/var/tmp"
-    zfs set devices=off "$ZFS_POOL/ROOT/ubuntu/var/tmp"
-    
-    zfs create -o mountpoint="$TARGET/var/log" "$ZFS_POOL/ROOT/ubuntu/var/log"    
-    zfs set atime=off "$ZFS_POOL/ROOT/ubuntu/var/log"
-    
-    zfs create -o com.sun:auto-snapshot=false -o mountpoint="$TARGET/var/cache/apt" "$ZFS_POOL/ROOT/ubuntu/var/cache/apt"    
-    zfs set atime=off "$ZFS_POOL/ROOT/ubuntu/var/cache/apt"
-    
-    # Create home dataset separately
-    zfs create -o mountpoint="$TARGET/home" "$ZFS_POOL/home"
-    
-    # Mount all datasets
-    zfs mount -a
-    
-    # Set permissions on the actual ZFS datasets
-    echo "Setting permissions on ZFS datasets..."
-    chmod 1777 "$TARGET/tmp"
+    # Create root pool
+    zpool create -f \
+        -o ashift=12 \
+        -o cachefile=/etc/zpool.cache \
+        -O compression=lz4 \
+        -O acltype=posixacl \
+        -O xattr=sa \
+        -O canmount=off \
+        -O mountpoint=/ \
+        -R "$TARGET" \
+        "$ZFS_POOL" "$ZFS_DEVICE"
+
+    # Create datasets
+    zfs create -o canmount=off -o mountpoint=none "$ZFS_POOL/ROOT"
+    zfs create -o canmount=noauto -o mountpoint=/ "$ZFS_POOL/ROOT/ubuntu"
+    zfs mount "$ZFS_POOL/ROOT/ubuntu"
+
+    zfs create -o canmount=off -o mountpoint=none "bpool/BOOT"
+    zfs create -o canmount=noauto -o mountpoint=/boot "bpool/BOOT/ubuntu"
+    zfs mount "bpool/BOOT/ubuntu"
+
+    zfs create "$ZFS_POOL/home"
+    zfs create -o canmount=off "$ZFS_POOL/var"
+    zfs create "$ZFS_POOL/var/log"
+    zfs create "$ZFS_POOL/var/spool"
+    zfs create -o com.sun:auto-snapshot=false "$ZFS_POOL/var/cache"
+    zfs create -o com.sun:auto-snapshot=false "$ZFS_POOL/var/tmp"
     chmod 1777 "$TARGET/var/tmp"
-    echo "✓ Temp directory permissions set (1777)"
-}
+    zfs create "$ZFS_POOL/srv"
+    zfs create -o canmount=off "$ZFS_POOL/usr"
+    zfs create "$ZFS_POOL/usr/local"
+    zfs create "$ZFS_POOL/var/mail"
+    zfs create -o com.sun:auto-snapshot=false -o canmount=on -o mountpoint=/tmp "$ZFS_POOL/tmp"
+    chmod 1777 "$TARGET/tmp"
 
-function set_final_mountpoints {
-    echo "======= Setting final mountpoints =========="
-    
-    # Leaf datasets - actual system mountpoints
-    zfs set mountpoint=/tmp "$ZFS_POOL/ROOT/ubuntu/tmp"
-    zfs set mountpoint=/var/tmp "$ZFS_POOL/ROOT/ubuntu/var/tmp"
-    zfs set mountpoint=/var/log "$ZFS_POOL/ROOT/ubuntu/var/log"
-    zfs set mountpoint=/var/cache/apt "$ZFS_POOL/ROOT/ubuntu/var/cache/apt"
-    
-    # Home dataset - separate from OS
-    zfs set mountpoint=/home "$ZFS_POOL/home"    
-    echo ""
-    echo "Detailed dataset listing:"
-    zfs list -o name,mountpoint -r "$ZFS_POOL"
+    zpool set bootfs="$ZFS_POOL/ROOT/ubuntu" "$ZFS_POOL"
 }
 
 # ---- System Bootstrap Functions ----
 function bootstrap_ubuntu_system {
-    echo "======= Bootstrapping Ubuntu to temporary directory =========="
-    local TEMP_STAGE
-    TEMP_STAGE=$(mktemp -d)
-    echo "Created temporary staging directory: $TEMP_STAGE"
-    
-    # Cleanup function for temp directory
-    cleanup_temp_stage() {
-        if [ -d "$TEMP_STAGE" ]; then
-            echo "Cleaning up temporary staging directory..."
-            rm -rf "$TEMP_STAGE"
-        fi
-    }
-    
-    # Add trap to ensure cleanup on script exit
-    trap cleanup_temp_stage EXIT
-    
+    echo "======= Bootstrapping Ubuntu =========="
+
     # Add Hetzner Ubuntu mirror as trusted
     echo "deb [trusted=yes] http://mirror.hetzner.com/ubuntu/packages noble main" > /etc/apt/sources.list.d/ubuntu-temp.list
 
-    # Update and download ubuntu-keyring without sandbox warning
     apt-get update
     apt-get -o APT::Sandbox::User=root download ubuntu-keyring
 
-    # Verify download was successful
     # shellcheck disable=SC2144
     if [ ! -f ubuntu-keyring*.deb ]; then
         echo "ERROR: Failed to download ubuntu-keyring package"
         exit 1
     fi
 
-    # Extract the keyring
     dpkg-deb -x ubuntu-keyring*.deb /tmp/ubuntu-keyring-extract/
     mkdir -p /usr/share/keyrings
     cp /tmp/ubuntu-keyring-extract/usr/share/keyrings/ubuntu-archive-keyring.gpg /usr/share/keyrings/
 
-    echo "✓ Downloaded and extracted ubuntu-keyring package"
-
-    # Clean up - remove temporary repository and restore apt state
     rm -f /etc/apt/sources.list.d/ubuntu-temp.list
     apt update
-
-    # Clean up downloaded package
     rm -f ubuntu-keyring*.deb
 
-    apt install -y mmdebstrap
+    debootstrap --arch=amd64 "$UBUNTU_CODENAME" "$TARGET" "${MIRROR_SITE}/ubuntu/packages"
 
-    mmdebstrap --variant=debootstrap \
-      --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
-      --include=systemd-resolved,locales,debconf-i18n,apt-utils,keyboard-configuration,console-setup,kbd,extlinux,initramfs-tools,zstd \
-      "$UBUNTU_CODENAME" "$TEMP_STAGE" \
-      "$MIRROR_MAIN" "$MIRROR_UPDATES" "$MIRROR_BACKPORTS" "$MIRROR_SECURITY"
-
-    echo "======= Copying staged system to ZFS datasets =========="
-    # Mount root dataset for copying
-    mkdir -p "$TARGET"
-    mount -t zfs "$ZFS_POOL/ROOT/ubuntu" "$TARGET"
-
-    create_additional_zfs_datasets
-
-    # Use rsync to copy the entire system (this will populate all datasets)
-    echo "Copying staged system to ZFS datasets..."
-    rsync -aAX "$TEMP_STAGE/" "$TARGET/"
-
-    echo "Staged system copied successfully"
-    echo "Source size: $(du -sh "$TEMP_STAGE")"
-    echo "Target size: $(du -sh "$TARGET")"
-
-    # Clean up temp directory
-    cleanup_temp_stage
-    trap - EXIT
+    zfs set devices=off "$ZFS_POOL"
 }
 
 function setup_chroot_environment {
@@ -493,45 +502,39 @@ function setup_chroot_environment {
 function configure_dns_resolution {
     echo "======= Configuring DNS resolution =========="
     mkdir -p "$TARGET/run/systemd/resolve"
-    
+
     if command -v resolvectl >/dev/null 2>&1; then
         echo "Getting DNS from resolvectl..."
-        
-        # First try Global DNS servers
+
         local DNS_SERVERS
         DNS_SERVERS=$(resolvectl dns | awk '
-            /^Global:/ { 
-                for(i=2; i<=NF; i++) print $i 
+            /^Global:/ {
+                for(i=2; i<=NF; i++) print $i
             }
         ' | head -3)
-        
-        # If Global is empty, find first non-empty link
+
         if [ -z "$DNS_SERVERS" ]; then
             echo "No global DNS servers found, searching for first non-empty link..."
             DNS_SERVERS=$(resolvectl dns | awk '
                 /^Link [0-9]+ / && NF > 3 {
-                    for(i=4; i<=NF; i++) print $i  # Start from field 4 to skip the interface name
-                    exit  # Stop after first non-empty link
+                    for(i=4; i<=NF; i++) print $i
+                    exit
                 }
             ')
         fi
-        
+
         if [ -n "$DNS_SERVERS" ]; then
-            # Create resolv.conf with the DNS servers
             echo "$DNS_SERVERS" | while read -r dns; do
                 echo "nameserver $dns"
             done > "$TARGET/run/systemd/resolve/stub-resolv.conf"
             echo "Using DNS servers: $(echo "$DNS_SERVERS" | tr '\n' ' ')"
         else
             echo "ERROR: No DNS servers found in resolvectl output"
-            echo "resolvectl dns output:"
             resolvectl dns
-            echo "Cannot continue without DNS configuration"
             exit 1
         fi
     else
         echo "ERROR: resolvectl command not found"
-        echo "Cannot configure DNS without resolvectl"
         exit 1
     fi
 }
@@ -539,64 +542,48 @@ function configure_dns_resolution {
 # ---- System Configuration Functions ----
 function configure_basic_system {
     echo "======= Configuring basic system settings =========="
+
+    # Set up apt sources
+    cat > "$TARGET/etc/apt/sources.list" <<EOF
+$MIRROR_MAIN
+$MIRROR_UPDATES
+$MIRROR_BACKPORTS
+$MIRROR_SECURITY
+EOF
+
     chroot "$TARGET" /bin/bash <<EOF
 set -euo pipefail
 
-# Set hostname from variable
 echo "$SYSTEM_HOSTNAME" > /etc/hostname
 
-# Configure timezone
 echo "UTC" > /etc/timezone
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
-# Generate locales
 cat > /etc/locale.gen <<'LOCALES'
 en_US.UTF-8 UTF-8
 LOCALES
 
 locale-gen
-
-# Set default locale
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-# Configure keyboard for US layout
 cat > /etc/default/keyboard <<'KEYBOARD'
-# KEYBOARD CONFIGURATION FILE
-
-# Consult the keyboard(5) manual page.
-
 XKBMODEL="pc105"
 XKBLAYOUT="us"
 XKBVARIANT=""
 XKBOPTIONS=""
-
 BACKSPACE="guess"
 KEYBOARD
 
-# Apply keyboard configuration to console
-setupcon --force
+setupcon --force || true
 
-# Update /etc/hosts with the hostname
 echo "127.0.0.1 localhost" > /etc/hosts
 echo "127.0.1.1 $SYSTEM_HOSTNAME" >> /etc/hosts
 echo "::1 localhost ip6-localhost ip6-loopback" >> /etc/hosts
 echo "ff02::1 ip6-allnodes" >> /etc/hosts
 echo "ff02::2 ip6-allrouters" >> /etc/hosts
 
-# Set proper permissions for ZFS datasets
 chmod 1777 /tmp
 chmod 1777 /var/tmp
-EOF
-
-    echo "======= Configuration Summary ======="
-    chroot "$TARGET" /bin/bash <<'EOF'
-echo "Hostname: $(cat /etc/hostname)"
-echo "Timezone: $(cat /etc/timezone)"
-echo "Current time: $(date)"
-echo "Default locale: $(grep LANG /etc/default/locale)"
-echo "Available locales:"
-locale -a | grep -E "en_US"
-echo "Keyboard layout: $(grep XKBLAYOUT /etc/default/keyboard)"
 EOF
 }
 
@@ -604,31 +591,45 @@ function install_system_packages {
     echo "======= Installing ZFS and essential packages in chroot =========="
     chroot "$TARGET" /bin/bash <<'EOF'
 set -euo pipefail
-# Update package lists
 apt update
 
-# Install generic kernel (creates files in ZFS dataset /boot)
 apt install -y --no-install-recommends linux-image-generic linux-headers-generic
 
-# Install ZFS utilities and aux packages
-
 echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
-
 apt install -y zfs-dkms zfsutils-linux zfs-initramfs software-properties-common bash curl nano htop net-tools ssh
 
-# Ensure ZFS module is included in initramfs
 echo "zfs" >> /etc/initramfs-tools/modules
+EOF
+}
 
-# Generate initramfs with ZFS support
-update-initramfs -u -k all
+function install_grub {
+    echo "======= Installing and configuring GRUB =========="
 
-# Verify kernel installation
-echo "Installed kernel packages:"
-dpkg -l | grep linux-image
-echo "Kernel version:"
-ls /lib/modules/
-echo "Kernel files in ZFS dataset:"
-ls -la /boot/vmlinuz* /boot/initrd.img* 2>/dev/null || echo "No kernel files found"
+    if [ "$EFI_MODE" = true ]; then
+        mkdir -p "$TARGET/boot/efi"
+        mount "$BOOT_PART" "$TARGET/boot/efi"
+        chroot "$TARGET" /bin/bash <<'EOF'
+set -euo pipefail
+apt install -y grub-efi-amd64
+EOF
+        chroot "$TARGET" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
+    else
+        chroot "$TARGET" /bin/bash <<'EOF'
+set -euo pipefail
+echo 'grub-pc grub-pc/install_devices_empty boolean true' | debconf-set-selections
+apt install -y grub-pc
+EOF
+        chroot "$TARGET" grub-install --recheck "$INSTALL_DISK"
+    fi
+
+    chroot "$TARGET" /bin/bash <<EOF
+set -euo pipefail
+sed -i 's/#GRUB_TERMINAL=console/GRUB_TERMINAL=console/g' /etc/default/grub
+sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="net.ifnames=0"|' /etc/default/grub
+sed -i 's|GRUB_CMDLINE_LINUX=""|GRUB_CMDLINE_LINUX="root=ZFS=$ZFS_POOL/ROOT/ubuntu"|g' /etc/default/grub
+sed -i 's/quiet//g' /etc/default/grub
+sed -i 's/splash//g' /etc/default/grub
+echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
 EOF
 }
 
@@ -649,7 +650,6 @@ function set_root_credentials {
     echo "======= Setting root password =========="
     chroot "$TARGET" /bin/bash -c "echo root:$(printf "%q" "$ROOT_PASSWORD") | chpasswd"
 
-    echo "============ Setting up root prompt ============"
     cat > "$TARGET/root/.bashrc" <<CONF
 export PS1='\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;32m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]'
 umask 022
@@ -658,103 +658,78 @@ eval "\$(dircolors)"
 CONF
 }
 
-# ---- Bootloader Functions ----
-function setup_efi_boot {
-    echo "======= Setting up EFI boot =========="
-    
-    # Mount EFI System Partition
-    mkdir -p "$MAIN_BOOT"
-    mount "$BOOT_PART" "$MAIN_BOOT"
-    
-    # Create EFI directory structure    
-    mkdir -p "$MAIN_BOOT/EFI/Boot"
-    
-    # Download ZFSBootMenu EFI binary
-    echo "Downloading ZFSBootMenu EFI binary from: $ZBM_EFI_URL"
-    curl -L "$ZBM_EFI_URL" -o "$MAIN_BOOT/EFI/Boot/bootx64.efi"    
+function setup_luks_crypttab {
+    echo "======= Configuring crypttab for LUKS =========="
+    local luks_uuid
+    luks_uuid=$(blkid -s UUID -o value "$ZFS_PART")
+
+    echo "$LUKS_DEVICE_NAME UUID=$luks_uuid none luks,discard,initramfs" > "$TARGET/etc/crypttab"
+
+    # Install cryptsetup in the target
+    chroot "$TARGET" /bin/bash <<'EOF'
+set -euo pipefail
+apt install -y cryptsetup cryptsetup-initramfs
+echo "CRYPTSETUP=y" >> /etc/cryptsetup-initramfs/conf-hook
+EOF
 }
 
-function setup_bios_boot {
-    echo "======= Setting up BIOS boot =========="
-    
-    # Mount boot partition
-    mkdir -p "$MAIN_BOOT"
-    mount "$BOOT_PART" "$MAIN_BOOT"
-    
-    # Install extlinux in rescue system if needed
-    if ! command -v extlinux &> /dev/null; then
-        echo "Installing extlinux in rescue system..."
-        apt update
-        apt install -y extlinux
-    fi
-    
-    # Install extlinux
-    extlinux --install "$MAIN_BOOT"
-    
-    # Create extlinux configuration
-    cat > "$MAIN_BOOT/extlinux.conf" << 'EOF'
-DEFAULT zfsbootmenu
-PROMPT 0
-TIMEOUT 0
-
-LABEL zfsbootmenu
-    LINUX /zfsbootmenu/vmlinuz-bootmenu
-    INITRD /zfsbootmenu/initramfs-bootmenu.img
-    APPEND ro quiet
+function setup_dropbear {
+    echo "======= Setting up dropbear for remote LUKS unlock =========="
+    chroot "$TARGET" /bin/bash <<'EOF'
+set -euo pipefail
+apt install -y dropbear-initramfs
 EOF
 
-    echo "Generated extlinux.conf:"
-    cat "$MAIN_BOOT/extlinux.conf"
-    
-    # Download and install ZFSBootMenu for BIOS
-    local TEMP_ZBM
-    TEMP_ZBM=$(mktemp -d)
-    echo "Downloading ZFSBootMenu for BIOS from: $ZBM_BIOS_URL"
-    curl -L "$ZBM_BIOS_URL" -o "$TEMP_ZBM/zbm.tar.gz"
-    tar -xz -C "$TEMP_ZBM" -f "$TEMP_ZBM/zbm.tar.gz" --strip-components=1
-    
-    # Copy ZFSBootMenu to boot partition
-    mkdir -p "$MAIN_BOOT/zfsbootmenu"
-    cp "$TEMP_ZBM"/vmlinuz* "$MAIN_BOOT/zfsbootmenu/"
-    cp "$TEMP_ZBM"/initramfs* "$MAIN_BOOT/zfsbootmenu/"
-    
-    # Clean up
-    rm -rf "$TEMP_ZBM"
-    
-    echo "ZFSBootMenu files copied to boot partition:"
-    ls -la "$MAIN_BOOT/zfsbootmenu/"
-    
-    # Install MBR and set boot flag
-    dd bs=440 conv=notrunc count=1 if="$TARGET/usr/lib/EXTLINUX/gptmbr.bin" of="$INSTALL_DISK"
-    parted "$INSTALL_DISK" set 1 boot on
-    
-    echo "BIOS boot setup complete"
+    mkdir -p "$TARGET/etc/dropbear/initramfs"
+    cp /root/.ssh/authorized_keys "$TARGET/etc/dropbear/initramfs/authorized_keys"
+
+    # Convert OpenSSH host keys to dropbear format
+    cp "$TARGET/etc/ssh/ssh_host_rsa_key" "$TARGET/etc/ssh/ssh_host_rsa_key_temp"
+    chroot "$TARGET" ssh-keygen -p -i -m pem -N '' -f /etc/ssh/ssh_host_rsa_key_temp
+    chroot "$TARGET" /usr/lib/dropbear/dropbearconvert openssh dropbear /etc/ssh/ssh_host_rsa_key_temp /etc/dropbear/initramfs/dropbear_rsa_host_key
+    rm -f "$TARGET/etc/ssh/ssh_host_rsa_key_temp"
+
+    cp "$TARGET/etc/ssh/ssh_host_ecdsa_key" "$TARGET/etc/ssh/ssh_host_ecdsa_key_temp"
+    chroot "$TARGET" ssh-keygen -p -i -m pem -N '' -f /etc/ssh/ssh_host_ecdsa_key_temp
+    chroot "$TARGET" /usr/lib/dropbear/dropbearconvert openssh dropbear /etc/ssh/ssh_host_ecdsa_key_temp /etc/dropbear/initramfs/dropbear_ecdsa_host_key
+    rm -f "$TARGET/etc/ssh/ssh_host_ecdsa_key_temp"
+
+    # Remove DSS key if present
+    rm -f "$TARGET/etc/dropbear/initramfs/dropbear_dss_host_key"
 }
 
-function configure_bootloader {
-    echo "======= Setting up boot based on firmware type =========="
-    if [ "$EFI_MODE" = true ]; then
-        setup_efi_boot
-    else
-        setup_bios_boot
-    fi
+function setup_initramfs_networking {
+    echo "======= Setting up initramfs networking hook =========="
+    mkdir -p "$TARGET/usr/share/initramfs-tools/scripts/init-premount"
+    cat > "$TARGET/usr/share/initramfs-tools/scripts/init-premount/static-route" <<'CONF'
+#!/bin/sh
+PREREQ=""
+prereqs()
+{
+    echo "$PREREQ"
+}
 
-    echo "======= Configuring ZFSBootMenu for auto-detection =========="
-    zfs set org.zfsbootmenu:commandline="ro quiet" "$ZFS_POOL/ROOT/ubuntu"
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
 
-    echo "Boot configuration:"
-    zfs get org.zfsbootmenu:commandline "$ZFS_POOL/ROOT/ubuntu"
+. /scripts/functions
+# Begin real processing below this line
+
+configure_networking
+CONF
+
+    chmod 755 "$TARGET/usr/share/initramfs-tools/scripts/init-premount/static-route"
 }
 
 # ---- System Services Functions ----
 function configure_system_services {
     echo "======= Configuring ZFS cachefile in chrooted system =========="
     mkdir -p "$TARGET/etc/zfs"
-    cp /etc/zfs/zpool.cache "$TARGET/etc/zfs/zpool.cache"
-
-    echo "Cachefile status:"
-    zpool get cachefile "$ZFS_POOL"
-    ls -la "$TARGET/etc/zfs/zpool.cache" && echo "✓ Cachefile ready" || echo "✗ Cachefile failed"
+    cp /etc/zpool.cache "$TARGET/etc/zfs/zpool.cache"
 
     echo "======= Enabling essential system services =========="
     chroot "$TARGET" /bin/bash <<'EOF'
@@ -768,9 +743,6 @@ systemctl enable zfs-mount
 
 systemctl enable ssh
 systemctl enable apt-daily.timer
-
-echo "Enabled services:"
-systemctl list-unit-files | grep enabled
 EOF
 }
 
@@ -778,7 +750,7 @@ function configure_networking {
     echo "======= Configuring Netplan for Hetzner Cloud =========="
     chroot "$TARGET" /bin/bash <<'EOF'
 set -euo pipefail
-# Create Netplan configuration that matches all non-loopback interfaces
+mkdir -p /etc/netplan
 cat > /etc/netplan/01-hetzner.yaml <<'EOL'
 network:
   version: 2
@@ -802,76 +774,52 @@ network:
       critical: true
 EOL
 
-# Set proper permissions - Netplan requires strict permissions (600)
 chmod 600 /etc/netplan/01-hetzner.yaml
 chown root:root /etc/netplan/01-hetzner.yaml
-
-# Apply the Netplan configuration
 netplan generate
-echo "Netplan configuration created for all interfaces"
 EOF
 }
 
-# ---- Cleanup and Finalization Functions ----
-function unmount_all_datasets_and_partitions {
-    echo "======= Unmounting all datasets =========="
-    
-    # First, unmount all auto-mounted ZFS datasets (tmp, var/tmp, var/log, etc.)
-    echo "Unmounting auto-mounted ZFS datasets..."
-    zfs umount -a 2>/dev/null || true
-    
-    # Manually unmount the root legacy dataset from $TARGET
-    if mountpoint -q "$TARGET"; then
-        echo "Unmounting root dataset from $TARGET"
-        umount "$TARGET" 2>/dev/null || true
-    fi
-    
-    # Manually unmount boot partition if mounted
-    if mountpoint -q "$MAIN_BOOT"; then
-        echo "Unmounting boot partition from $MAIN_BOOT"
-        umount "$MAIN_BOOT" 2>/dev/null || true
-    fi
-    
-    # Wait for unmounts to complete
-    sleep 1
-    
-    # Force unmount any stubborn datasets
-    if zfs get mounted -r "$ZFS_POOL" 2>/dev/null | grep -q "yes"; then
-        echo "Forcing unmount of remaining ZFS datasets..."
-        zfs umount -a -f 2>/dev/null || true
-    fi
-    
-    # Final verification
-    local mounted_count=0
-    mounted_count=$(zfs get mounted -r "$ZFS_POOL" 2>/dev/null | grep -c "yes" || true)
-    
-    if [ "$mounted_count" -gt 0 ]; then
-        echo "WARNING: $mounted_count dataset(s) still mounted after unmount attempt:"
-        zfs get mounted -r "$ZFS_POOL" 2>/dev/null | grep "yes" || true
-    else
-        echo "✓ All ZFS datasets successfully unmounted"
-    fi
-    
-    # Verify $TARGET is unmounted
-    if mountpoint -q "$TARGET"; then
-        echo "WARNING: $TARGET is still mounted!"
-        mount | grep "$TARGET" || true
-    else
-        echo "✓ $TARGET successfully unmounted"
-    fi
-    
-    # Verify $MAIN_BOOT is unmounted
-    if mountpoint -q "$MAIN_BOOT"; then
-        echo "WARNING: $MAIN_BOOT is still mounted!"
-        mount | grep "$MAIN_BOOT" || true
-    else
-        echo "✓ $MAIN_BOOT successfully unmounted"
+function finalize_initramfs_and_grub {
+    echo "======= Updating initramfs and GRUB =========="
+    chroot "$TARGET" /bin/bash <<'EOF'
+set -euo pipefail
+echo RESUME=none > /etc/initramfs-tools/conf.d/resume
+update-initramfs -u -k all
+update-grub
+EOF
+}
+
+function set_mountpoints_and_fstab {
+    echo "======= Setting mountpoints and fstab =========="
+
+    chroot "$TARGET" /bin/bash <<EOF
+set -euo pipefail
+
+zfs set mountpoint=legacy bpool/BOOT/ubuntu
+echo "bpool/BOOT/ubuntu /boot zfs nodev,relatime,x-systemd.requires=zfs-mount.service,x-systemd.device-timeout=10 0 0" > /etc/fstab
+
+zfs set mountpoint=legacy $ZFS_POOL/var/log
+echo "$ZFS_POOL/var/log /var/log zfs nodev,relatime 0 0" >> /etc/fstab
+
+zfs set mountpoint=legacy $ZFS_POOL/var/spool
+echo "$ZFS_POOL/var/spool /var/spool zfs nodev,relatime 0 0" >> /etc/fstab
+
+zfs set mountpoint=legacy $ZFS_POOL/var/tmp
+echo "$ZFS_POOL/var/tmp /var/tmp zfs nodev,relatime 0 0" >> /etc/fstab
+
+zfs set mountpoint=legacy $ZFS_POOL/tmp
+echo "$ZFS_POOL/tmp /tmp zfs nodev,relatime 0 0" >> /etc/fstab
+EOF
+
+    if [ "$EFI_MODE" = true ]; then
+        echo "PARTLABEL=EFI /boot/efi vfat defaults 0 0" >> "$TARGET/etc/fstab"
     fi
 }
 
+# ---- Cleanup and Finalization Functions ----
 function unmount_chroot_environment {
     echo "======= Unmounting virtual filesystems =========="
-    # Unmount virtual filesystems first
     for dir in dev/pts dev tmp run sys proc; do
         if mountpoint -q "$TARGET/$dir"; then
             echo "Unmounting $TARGET/$dir"
@@ -880,35 +828,31 @@ function unmount_chroot_environment {
     done
 }
 
-function finalize_system_resolved {
-    echo "======= Setting systemd-resolved configuration for final boot =========="
-    # This must be done while $TARGET is still mounted
-    mkdir -p "$TARGET/run/systemd/resolve"
-    cat > "$TARGET/run/systemd/resolve/stub-resolv.conf" << 'EOF'
-nameserver 127.0.0.53
-options edns0 trust-ad
-search .
-EOF
-    echo "✓ systemd-resolved configuration set"
-}
+function unmount_and_export {
+    echo "======= Unmounting filesystems and exporting pools =========="
 
-function export_zfs_pool {
-    echo "======= Exporting ZFS pool =========="
+    if [ "$EFI_MODE" = true ] && mountpoint -q "$TARGET/boot/efi"; then
+        umount "$TARGET/boot/efi" 2>/dev/null || true
+    fi
+
+    zfs umount -a 2>/dev/null || true
+
+    if mountpoint -q "$TARGET"; then
+        umount "$TARGET" 2>/dev/null || true
+    fi
+
+    zpool export bpool 2>/dev/null || true
     zpool export "$ZFS_POOL" 2>/dev/null || true
 
-    # Verify everything is unmounted
-    if mountpoint -q "$TARGET"; then
-        echo "WARNING: $TARGET is still mounted!"
-        mount | grep "$TARGET"
-    else
-        echo "✓ All filesystems successfully unmounted"
+    if [ "$ENCRYPT_ROOT" = "1" ]; then
+        cryptsetup close "$LUKS_DEVICE_NAME" 2>/dev/null || true
     fi
 }
 
 function show_final_instructions {
     echo ""
     echo "=========================================="
-    echo "  INSTALLATION COMPLETE! "
+    echo "  INSTALLATION COMPLETE!"
     echo "=========================================="
     echo ""
     echo "System Information:"
@@ -916,7 +860,14 @@ function show_final_instructions {
     echo "  ZFS Pool: $ZFS_POOL"
     echo "  Boot Mode: $([ "$EFI_MODE" = true ] && echo "EFI" || echo "BIOS")"
     echo "  Ubuntu Version: $UBUNTU_CODENAME"
-    echo "  Networking: systemd-networkd + systemd-resolved"    
+    if [ "$ENCRYPT_ROOT" = "1" ]; then
+        echo "  Encryption: LUKS (dm-crypt)"
+        echo "  Remote Unlock: dropbear SSH on boot"
+        echo ""
+        echo "  To unlock at boot:"
+        echo "    ssh root@<server-ip>"
+        echo "    Then enter your LUKS passphrase when prompted"
+    fi
     echo ""
     echo "=========================================="
     echo "Rebooting..."
@@ -925,52 +876,60 @@ function show_final_instructions {
 # ---- Main Execution Function ----
 function main {
     echo "Starting ZFS Ubuntu installation on Hetzner Cloud..."
-    
+
     # Phase 0: User input
     get_user_input
-    
+
     # Phase 1: System detection and preparation
     detect_efi
     find_install_disk
-    
-    # Show summary and get final confirmation
+
     show_summary_and_confirm
-    
+
     remove_unused_kernels
     install_zfs_on_rescue_system
-    
-    # Phase 2: Disk partitioning and ZFS setup
+
+    # Phase 2: Disk partitioning
     partition_disk
-    create_zfs_pool
-    
-    # Phase 3: System bootstrap
+
+    # Phase 2.5: LUKS encryption (if enabled)
+    if [ "$ENCRYPT_ROOT" = "1" ]; then
+        setup_luks
+    fi
+
+    # Phase 3: ZFS pool and dataset creation
+    create_zfs_pools
+
+    # Phase 4: System bootstrap
     bootstrap_ubuntu_system
     setup_chroot_environment
-    
-    # Phase 4: System configuration
+
+    # Phase 5: System configuration
     configure_basic_system
     install_system_packages
+    install_grub
     configure_ssh
     set_root_credentials
     configure_system_services
     configure_networking
-    
-    # Phase 5: Bootloader setup
-    configure_bootloader
-    
-    # Phase 6: Cleanup and finalization
+
+    # Phase 6: Encryption support (if enabled)
+    if [ "$ENCRYPT_ROOT" = "1" ]; then
+        setup_luks_crypttab
+        setup_dropbear
+        setup_initramfs_networking
+    fi
+
+    # Phase 7: Finalize boot
+    finalize_initramfs_and_grub
+    set_mountpoints_and_fstab
+
+    # Phase 8: Cleanup
     unmount_chroot_environment
-    finalize_system_resolved
-    set_final_mountpoints
-    unmount_all_datasets_and_partitions
+    unmount_and_export
 
-    # Phase 7: Export pool
-    export_zfs_pool
-    
     show_final_instructions
-
     reboot
 }
 
-# Execute main function
 main "$@"
